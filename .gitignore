@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# Ignore large datasets and generated results
+dataset_extractedfaces.zip
+dataset_extractedfaces/
+results_pgn/
+*.zip
