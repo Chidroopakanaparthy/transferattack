@@ -36,6 +36,9 @@ def impact(clean, adv, attack_type):
 def build_leaderboard(out_dir, base_name):
     # Base baseline summary
     base_file = f'results_baseline/subset_{base_name}.csv'
+    if not os.path.exists(base_file):
+        print(f"Skipping leaderboard for {base_name} as baseline CSV not found.")
+        return
     dfs = [pd.read_csv(base_file)]
     
     # Student summaries
@@ -43,7 +46,9 @@ def build_leaderboard(out_dir, base_name):
         dfs.append(pd.read_csv(p))
     
     # PGN summary
-    dfs.append(pd.read_csv(out_dir / f'pgn_{base_name}.csv'))
+    pgn_file = out_dir / f'pgn_{base_name}.csv'
+    if os.path.exists(pgn_file):
+        dfs.append(pd.read_csv(pgn_file))
     
     combined = pd.concat(dfs, ignore_index=True)
     
@@ -58,7 +63,17 @@ def build_leaderboard(out_dir, base_name):
     combined.to_csv(out_dir / f'full_leaderboard_{base_name}.csv', index=False)
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--smoke-test', action='store_true', help='Run 2 pairs for 1 attacker')
+    args = ap.parse_args()
+
     df = pd.read_csv('docs/subset_input_pairs.csv')
+    if args.smoke_test:
+        df = df.head(2)
+        global ATTACKERS
+        ATTACKERS = [ATTACKERS[0]]
+
     dataset_root = 'dataset_extractedfaces'
     out_dir = Path('results_pgn')
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -71,20 +86,18 @@ def main():
     clean_sims = raw_df[raw_df['attack_method'] == 'clean'].copy()
     
     raw_rows = []
+    error_rows = []
+    error_log = out_dir / 'errors.csv'
     
     # Cache victim models to avoid reloading
     victim_cache = {}
     def get_victim(v_name):
         if v_name not in victim_cache:
             if v_name == 'IR152':
-                # Skip if not available, but let's see. 
-                # Wait, "IR152 resources should be taken from the shared Drive folder, not from this repo."
-                # Does build_attacker('IR152') work? Let's check try-except.
-                try:
-                    victim_cache[v_name] = build_attacker(v_name)
-                except Exception as e:
-                    print(f"Skipping IR152 due to missing weights: {e}")
-                    victim_cache[v_name] = None
+                if os.path.exists('core/IR152.h5'):
+                    victim_cache[v_name] = tf.keras.models.load_model('core/IR152.h5', compile=False)
+                else:
+                    raise FileNotFoundError("IR152 weights not found at core/IR152.h5 - please ensure Drive download placed them there.")
             else:
                 victim_cache[v_name] = build_attacker(v_name)
         return victim_cache[v_name]
@@ -98,69 +111,77 @@ def main():
         
         for _, rec in df.iterrows():
             row_id = int(rec['row_id'])
-            src_path = resolve_image_path(rec['img1'], dataset_root)
-            tgt_path = resolve_image_path(rec['img2'], dataset_root)
-            
-            src = tf.expand_dims(load_and_preprocess(src_path, input_size), 0)
-            tgt = tf.expand_dims(load_and_preprocess(tgt_path, input_size), 0)
-            
-            # Generate PGN attack
-            adv = run_attack('PGN', model, src, tgt, rec['attack_type'], input_size)
-            adv_np = denormalize(adv.numpy()[0])
-            
-            # Save the adv image
-            pgn_path = save_adv(adv_np, 'PGN', src_path, tgt_path, rec['attack_type'], attacker, row_id, str(out_dir))
-            
-            # Evaluate against victims
-            for victim in VICTIMS:
-                if equivalent_models(attacker, victim):
-                    continue
-                if equivalent_models(attacker, 'Facenet512') and equivalent_models(victim, 'Facenet'):
-                    continue
+            try:
+                src_path = resolve_image_path(rec['img1'], dataset_root)
+                tgt_path = resolve_image_path(rec['img2'], dataset_root)
                 
-                v_model = get_victim(victim)
-                if v_model is None:
-                    continue # skipped IR152 if not found
+                src = tf.expand_dims(load_and_preprocess(src_path, input_size), 0)
+                tgt = tf.expand_dims(load_and_preprocess(tgt_path, input_size), 0)
                 
-                v_size = ATTACKER_MODELS.get(victim, (112, 112))
-                if victim == 'Facenet':
-                    v_size = (160, 160)
-                elif victim == 'Facenet512':
-                    v_size = (160, 160)
-                elif victim == 'ArcFace':
-                    v_size = (112, 112)
-                elif victim == 'GhostFaceNet':
-                    v_size = (112, 112)
-                elif victim == 'VGG-Face':
-                    v_size = (224, 224)
+                # Generate PGN attack
+                adv = run_attack('PGN', model, src, tgt, rec['attack_type'], input_size)
+                adv_np = denormalize(adv.numpy()[0])
                 
-                # Resize adv and tgt for victim
-                v_adv = tf.image.resize(adv, v_size)
-                v_tgt = tf.expand_dims(load_and_preprocess(tgt_path, v_size), 0) # re-load properly
-                # actually wait, it's safer to re-load tgt or just resize. In core it resizes: tf.image.resize(tgt, v_size)
-                # But transfer_attack_core uses tf.image.resize(adv, v_size) and tf.image.resize(tgt, v_size) for DYNAMIC_MORPH
+                # Save the adv image
+                pgn_path = save_adv(adv_np, 'PGN', src_path, tgt_path, rec['attack_type'], attacker, row_id, str(out_dir))
                 
-                # We can just load clean images dynamically for victim size
-                v_tgt_img = tf.expand_dims(load_and_preprocess(tgt_path, v_size), 0)
+                # Evaluate against victims
+                for victim in VICTIMS:
+                    if equivalent_models(attacker, victim):
+                        continue
+                    if equivalent_models(attacker, 'Facenet512') and equivalent_models(victim, 'Facenet'):
+                        continue
+                    
+                    v_model = get_victim(victim)
+                    if v_model is None:
+                        continue # skipped IR152 if not found
+                    
+                    v_size = ATTACKER_MODELS.get(victim, (112, 112))
+                    if victim == 'Facenet':
+                        v_size = (160, 160)
+                    elif victim == 'Facenet512':
+                        v_size = (160, 160)
+                    elif victim == 'ArcFace':
+                        v_size = (112, 112)
+                    elif victim == 'GhostFaceNet':
+                        v_size = (112, 112)
+                    elif victim == 'VGG-Face':
+                        v_size = (224, 224)
+                    
+                    # Resize adv and tgt for victim
+                    v_adv = tf.image.resize(adv, v_size)
+                    v_tgt = tf.expand_dims(load_and_preprocess(tgt_path, v_size), 0) # re-load properly
+                    
+                    # We can just load clean images dynamically for victim size
+                    v_tgt_img = tf.expand_dims(load_and_preprocess(tgt_path, v_size), 0)
+                    
+                    emb_adv = compute_embedding(v_model, v_adv)
+                    emb_tgt = compute_embedding(v_model, v_tgt_img)
+                    sim = float(tf.reduce_sum(emb_adv * emb_tgt, axis=1).numpy()[0])
+                    
+                    raw_rows.append({
+                        'row_id': row_id,
+                        'attacker_model': attacker,
+                        'img1': rec['img1'],
+                        'img2': rec['img2'],
+                        'dataset': rec['dataset'],
+                        'attack_type': rec['attack_type'],
+                        'source_csv': 'docs/subset_input_pairs.csv',
+                        'victim_model': victim,
+                        'attack_method': 'PGN',
+                        'variant': 'vanilla',
+                        'similarity': sim,
+                        'source_column': 'pgn_path'
+                    })
+            except Exception as e:
+                print(f"Error on row {row_id} with attacker {attacker}: {e}")
+                error_rows.append({'row_id': row_id, 'attacker_model': attacker, 'error': str(e)})
+                pd.DataFrame(error_rows).to_csv(error_log, index=False)
                 
-                emb_adv = compute_embedding(v_model, v_adv)
-                emb_tgt = compute_embedding(v_model, v_tgt_img)
-                sim = float(tf.reduce_sum(emb_adv * emb_tgt, axis=1).numpy()[0])
-                
-                raw_rows.append({
-                    'row_id': row_id,
-                    'attacker_model': attacker,
-                    'img1': rec['img1'],
-                    'img2': rec['img2'],
-                    'dataset': rec['dataset'],
-                    'attack_type': rec['attack_type'],
-                    'source_csv': 'docs/subset_input_pairs.csv',
-                    'victim_model': victim,
-                    'attack_method': 'PGN',
-                    'variant': 'vanilla',
-                    'similarity': sim,
-                    'source_column': 'pgn_path'
-                })
+        # Checkpoint after each attacker model finishes
+        if raw_rows:
+            partial_df = pd.DataFrame(raw_rows)
+            partial_df.to_csv(out_dir / f'pgn_subset_raw_similarities_partial.csv', index=False)
         
         elapsed = time.time() - start_time
         print(f"Completed {attacker} in {elapsed:.2f} seconds.")
