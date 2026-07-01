@@ -18,6 +18,7 @@ from core.transfer_attack_core import (
     compute_embedding,
     save_adv,
 )
+from core.ir152_loader import load_ir152, compute_ir152_embedding
 
 ATTACKERS = ['Facenet512', 'ArcFace', 'GhostFaceNet', 'VGG-Face']
 VICTIMS = ['Facenet512', 'ArcFace', 'GhostFaceNet', 'VGG-Face', 'IR152']
@@ -94,10 +95,7 @@ def main():
     def get_victim(v_name):
         if v_name not in victim_cache:
             if v_name == 'IR152':
-                if os.path.exists('core/IR152.h5'):
-                    victim_cache[v_name] = tf.keras.models.load_model('core/IR152.h5', compile=False)
-                else:
-                    raise FileNotFoundError("IR152 weights not found at core/IR152.h5 - please ensure Drive download placed them there.")
+                victim_cache[v_name] = load_ir152('core/ir152.pth')
             else:
                 victim_cache[v_name] = build_attacker(v_name)
         return victim_cache[v_name]
@@ -155,9 +153,17 @@ def main():
                     # We can just load clean images dynamically for victim size
                     v_tgt_img = tf.expand_dims(load_and_preprocess(tgt_path, v_size), 0)
                     
-                    emb_adv = compute_embedding(v_model, v_adv)
-                    emb_tgt = compute_embedding(v_model, v_tgt_img)
-                    sim = float(tf.reduce_sum(emb_adv * emb_tgt, axis=1).numpy()[0])
+                    if victim == 'IR152':
+                        # Use PyTorch pipeline for IR152
+                        emb_adv = compute_ir152_embedding(v_model, v_adv)
+                        emb_tgt = compute_ir152_embedding(v_model, v_tgt_img)
+                        # np sum instead of tf reduce_sum because emb is numpy
+                        import numpy as np
+                        sim = float(np.sum(emb_adv * emb_tgt, axis=1)[0])
+                    else:
+                        emb_adv = compute_embedding(v_model, v_adv)
+                        emb_tgt = compute_embedding(v_model, v_tgt_img)
+                        sim = float(tf.reduce_sum(emb_adv * emb_tgt, axis=1).numpy()[0])
                     
                     raw_rows.append({
                         'row_id': row_id,
