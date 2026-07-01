@@ -22,6 +22,7 @@ VICTIM_MODELS = ['Facenet512', 'ArcFace', 'GhostFaceNet', 'VGG-Face', 'IR152']
 
 ALL_ATTACKS = [
     'PGD',
+    'PGN',
     'MI_FGSM',
     'TI_FGSM',
     'SI_NI_FGSM',
@@ -43,6 +44,7 @@ ALL_ATTACKS = [
 
 ATTACK_COLS = {
     'PGD': 'pgd_path',
+    'PGN': 'pgn_path',
     'MI_FGSM': 'mi_fgsm_path',
     'TI_FGSM': 'ti_fgsm_path',
     'SI_NI_FGSM': 'si_ni_fgsm_path',
@@ -236,6 +238,72 @@ def _idaa_local_mix(batch, alpha=0.4):
     mixed = tf.concat([upper, lower], axis=1)
 
     return lam * mixed + (1.0 - lam) * batch
+
+def pgn_attack(model, x, tgt_emb, attack_type, zeta=3.0, delta=0.5, N=20):
+    """
+    PGN (Penalizing Gradient Norm)
+    'Boosting Adversarial Transferability by Achieving Flat Local Maxima'
+    Zhijin Ge, Hongying Liu, Xiaosen Wang, Fanhua Shang, Yuanyuan Liu (NeurIPS 2023)
+    https://arxiv.org/abs/2306.05225
+    
+    Implements Algorithm 1 from the paper and canonical repo:
+    1. Sample x' uniformly from a zeta-ball around the current adversarial example.
+    2. Compute gradient g' at x'.
+    3. Compute look-ahead point x* = x' - alpha * (g' / ||g'||_1).
+    4. Compute second gradient g* at x*.
+    5. Combine g' and g* per sample, average over N samples, feed to momentum loop.
+    """
+    adv = tf.identity(x)
+    g = tf.zeros_like(x)
+    alpha = EPSILON / NUM_ITER
+    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
+
+    for _ in range(NUM_ITER):
+        # 1. Sample x' uniformly from zeta-ball
+        noise_uniform = tf.random.uniform(
+            shape=[N, tf.shape(adv)[1], tf.shape(adv)[2], tf.shape(adv)[3]],
+            minval=-EPSILON * zeta,
+            maxval=EPSILON * zeta,
+            dtype=adv.dtype
+        )
+        x_near = adv + noise_uniform
+        
+        # 2. Compute first gradient g' at x_near
+        with tf.GradientTape() as tape1:
+            tape1.watch(x_near)
+            emb1 = compute_embedding(model, x_near)
+            tgt_rep1 = tf.repeat(tgt_emb, N, axis=0)
+            cos1 = tf.reduce_sum(emb1 * tgt_rep1, axis=1)
+            loss1 = attack_loss(cos1, attack_type)
+        g1 = tape1.gradient(loss1, x_near)
+
+        # 3. Compute look-ahead point x* 
+        # (Stepping in the negative gradient direction of the adversarial loss)
+        norm_g1 = tf.reduce_mean(tf.abs(g1), axis=[1, 2, 3], keepdims=True) + 1e-8
+        x_star = x_near - alpha * (g1 / norm_g1)
+
+        # 4. Compute second gradient g* at x*
+        with tf.GradientTape() as tape2:
+            tape2.watch(x_star)
+            emb2 = compute_embedding(model, x_star)
+            tgt_rep2 = tf.repeat(tgt_emb, N, axis=0)
+            cos2 = tf.reduce_sum(emb2 * tgt_rep2, axis=1)
+            loss2 = attack_loss(cos2, attack_type)
+        g2 = tape2.gradient(loss2, x_star)
+
+        # 5. Combine and average
+        combined_grad = (1.0 - delta) * g1 + delta * g2
+        avg_grad = tf.reduce_mean(combined_grad, axis=0, keepdims=True)
+        
+        # Momentum & sign update (matches mi_fgsm)
+        avg_grad = avg_grad / (tf.reduce_mean(tf.abs(avg_grad)) + 1e-8)
+        g = DECAY * g + avg_grad
+        adv = adv + alpha * tf.sign(g)
+        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
+        adv = tf.clip_by_value(adv, -1.0, 1.0)
+        
+    return adv
+
 
 def pgd_attack(model, x, tgt_emb, attack_type, random_start=True):
     if random_start:
@@ -1341,6 +1409,8 @@ def run_attack(attack_name: str, model, src, tgt, attack_type: str, input_size):
     tgt_emb = compute_embedding(model, tgt)
     if attack_name == 'PGD':
         return pgd_attack(model, src, tgt_emb, attack_type)
+    if attack_name == 'PGN':
+        return pgn_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'MI_FGSM':
         return mi_fgsm(model, src, tgt_emb, attack_type)
     if attack_name == 'TI_FGSM':
