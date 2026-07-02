@@ -2,9 +2,8 @@ import os
 import random
 import uuid
 from pathlib import Path
-import sys
-import gc
 
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 
 import numpy as np
@@ -23,7 +22,6 @@ VICTIM_MODELS = ['Facenet512', 'ArcFace', 'GhostFaceNet', 'VGG-Face', 'IR152']
 
 ALL_ATTACKS = [
     'PGD',
-    'PGN',
     'MI_FGSM',
     'TI_FGSM',
     'SI_NI_FGSM',
@@ -41,11 +39,11 @@ ALL_ATTACKS = [
     'DPA_HMA',
     'DYNAMIC_MORPH',
     'DPA_HMA_ENSEMBLE',
+    'DHF',
 ]
 
 ATTACK_COLS = {
     'PGD': 'pgd_path',
-    'PGN': 'pgn_path',
     'MI_FGSM': 'mi_fgsm_path',
     'TI_FGSM': 'ti_fgsm_path',
     'SI_NI_FGSM': 'si_ni_fgsm_path',
@@ -63,6 +61,7 @@ ATTACK_COLS = {
     'DPA_HMA': 'dpa_hma_path',
     'DYNAMIC_MORPH': 'dynamic_morph_path',
     'DPA_HMA_ENSEMBLE': 'dpa_hma_ensemble_path',
+    'DHF': 'dhf_path',
 }
 
 EPSILON = 0.062
@@ -240,72 +239,6 @@ def _idaa_local_mix(batch, alpha=0.4):
 
     return lam * mixed + (1.0 - lam) * batch
 
-def pgn_attack(model, x, tgt_emb, attack_type, zeta=3.0, delta=0.5, N=20):
-    """
-    PGN (Penalizing Gradient Norm)
-    'Boosting Adversarial Transferability by Achieving Flat Local Maxima'
-    Zhijin Ge, Hongying Liu, Xiaosen Wang, Fanhua Shang, Yuanyuan Liu (NeurIPS 2023)
-    https://arxiv.org/abs/2306.05225
-    
-    Implements Algorithm 1 from the paper and canonical repo:
-    1. Sample x' uniformly from a zeta-ball around the current adversarial example.
-    2. Compute gradient g' at x'.
-    3. Compute look-ahead point x* = x' - alpha * (g' / ||g'||_1).
-    4. Compute second gradient g* at x*.
-    5. Combine g' and g* per sample, average over N samples, feed to momentum loop.
-    """
-    adv = tf.identity(x)
-    g = tf.zeros_like(x)
-    alpha = EPSILON / NUM_ITER
-    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
-
-    for _ in range(NUM_ITER):
-        # 1. Sample x' uniformly from zeta-ball
-        noise_uniform = tf.random.uniform(
-            shape=[N, tf.shape(adv)[1], tf.shape(adv)[2], tf.shape(adv)[3]],
-            minval=-EPSILON * zeta,
-            maxval=EPSILON * zeta,
-            dtype=adv.dtype
-        )
-        x_near = adv + noise_uniform
-        
-        # 2. Compute first gradient g' at x_near
-        with tf.GradientTape() as tape1:
-            tape1.watch(x_near)
-            emb1 = compute_embedding(model, x_near)
-            tgt_rep1 = tf.repeat(tgt_emb, N, axis=0)
-            cos1 = tf.reduce_sum(emb1 * tgt_rep1, axis=1)
-            loss1 = attack_loss(cos1, attack_type)
-        g1 = tape1.gradient(loss1, x_near)
-
-        # 3. Compute look-ahead point x* 
-        # (Stepping in the negative gradient direction of the adversarial loss)
-        norm_g1 = tf.reduce_mean(tf.abs(g1), axis=[1, 2, 3], keepdims=True) + 1e-8
-        x_star = x_near - alpha * (g1 / norm_g1)
-
-        # 4. Compute second gradient g* at x*
-        with tf.GradientTape() as tape2:
-            tape2.watch(x_star)
-            emb2 = compute_embedding(model, x_star)
-            tgt_rep2 = tf.repeat(tgt_emb, N, axis=0)
-            cos2 = tf.reduce_sum(emb2 * tgt_rep2, axis=1)
-            loss2 = attack_loss(cos2, attack_type)
-        g2 = tape2.gradient(loss2, x_star)
-
-        # 5. Combine and average
-        combined_grad = (1.0 - delta) * g1 + delta * g2
-        avg_grad = tf.reduce_mean(combined_grad, axis=0, keepdims=True)
-        
-        # Momentum & sign update (matches mi_fgsm)
-        avg_grad = avg_grad / (tf.reduce_mean(tf.abs(avg_grad)) + 1e-8)
-        g = DECAY * g + avg_grad
-        adv = adv + alpha * tf.sign(g)
-        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
-        adv = tf.clip_by_value(adv, -1.0, 1.0)
-        
-    return adv
-
-
 def pgd_attack(model, x, tgt_emb, attack_type, random_start=True):
     if random_start:
         noise = tf.random.uniform(tf.shape(x), minval=-EPSILON, maxval=EPSILON, dtype=x.dtype)
@@ -344,6 +277,85 @@ def mi_fgsm(model, x, tgt_emb, attack_type):
         adv = adv + alpha * tf.sign(g)
         adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
         adv = tf.clip_by_value(adv, -1.0, 1.0)
+    return adv
+
+
+def dhf_attack(model, x, tgt_emb, attack_type):
+    """
+    Diversifying the High-level Features (DHF) attack.
+    Paper: Diversifying the High-level Features for better Adversarial Transferability (BMVC 2023)
+    """
+    adv = tf.identity(x)
+    g = tf.zeros_like(x)
+    alpha = EPSILON / NUM_ITER
+    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
+    
+    num_layers = len(model.layers)
+    if num_layers == 447:     # Facenet512
+        hook_idx = -5
+    elif num_layers == 162:   # ArcFace
+        hook_idx = -4
+    elif num_layers == 298:   # GhostFaceNet
+        hook_idx = -7
+        # Fix layer name collision in GhostFaceNet's internal Keras functional model
+        seen_names = set()
+        for i, layer in enumerate(model.layers):
+            if layer.name in seen_names:
+                layer._name = f"{layer.name}_{i}"
+            seen_names.add(layer.name)
+    elif num_layers == 36:    # VGG-Face
+        hook_idx = -5
+    else:
+        hook_idx = -4
+        
+    target_layer = model.layers[hook_idx]
+    feature_model = tf.keras.Model(inputs=model.input, outputs=target_layer.output)
+    
+    # Benign feature extraction (outside GradientTape)
+    benign_feat = feature_model(x, training=False)
+    if isinstance(benign_feat, list):
+        benign_feat = benign_feat[0]
+        
+    for _ in range(NUM_ITER):
+        with tf.GradientTape() as tape:
+            tape.watch(adv)
+            
+            # 1. Forward to hook
+            net = feature_model(adv, training=False)
+            if isinstance(net, list):
+                net = net[0]
+                
+            # 2. DHF Mixup (M1)
+            w = tf.random.uniform([], minval=0.0, maxval=0.2)
+            mixup_feat = w * benign_feat + (1.0 - w) * net
+            mix_mask = tf.cast((tf.random.uniform(tf.shape(net)) > 0.8), dtype=tf.float32)
+            net = mix_mask * mixup_feat + (1.0 - mix_mask) * net
+            
+            # 3. DHF Masking (M2)
+            mean_axis = list(range(1, len(net.shape)))
+            feat_mean = tf.reduce_mean(net, axis=mean_axis, keepdims=True)
+            drop_mask = tf.cast((tf.random.uniform(tf.shape(net)) <= 0.9), dtype=tf.float32)
+            net = drop_mask * net + (1.0 - drop_mask) * feat_mean
+            
+            # 4. Replay tail layers
+            for layer in model.layers[hook_idx+1:]:
+                if isinstance(layer, (tf.keras.layers.BatchNormalization, tf.keras.layers.Dropout)):
+                    net = layer(net, training=False)
+                else:
+                    net = layer(net)
+                    
+            emb = tf.nn.l2_normalize(net, axis=1)
+            cos = tf.reduce_sum(emb * tgt_emb, axis=1)
+            loss = attack_loss(cos, attack_type)
+            
+        # Perturbation update & clipping (matches mi_fgsm)
+        grad = tape.gradient(loss, adv)
+        grad = grad / (tf.reduce_mean(tf.abs(grad)) + 1e-8)
+        g = DECAY * g + grad
+        adv = adv + alpha * tf.sign(g)
+        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
+        adv = tf.clip_by_value(adv, -1.0, 1.0)
+        
     return adv
 
 
@@ -1410,10 +1422,10 @@ def run_attack(attack_name: str, model, src, tgt, attack_type: str, input_size):
     tgt_emb = compute_embedding(model, tgt)
     if attack_name == 'PGD':
         return pgd_attack(model, src, tgt_emb, attack_type)
-    if attack_name == 'PGN':
-        return pgn_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'MI_FGSM':
         return mi_fgsm(model, src, tgt_emb, attack_type)
+    if attack_name == 'DHF':
+        return dhf_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'TI_FGSM':
         return ti_fgsm(model, src, tgt_emb, attack_type)
     if attack_name == 'SI_NI_FGSM':
