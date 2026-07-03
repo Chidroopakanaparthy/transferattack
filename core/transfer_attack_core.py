@@ -3,7 +3,7 @@ import random
 import uuid
 from pathlib import Path
 
-# os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 
 import numpy as np
@@ -26,6 +26,7 @@ ALL_ATTACKS = [
     'TI_FGSM',
     'SI_NI_FGSM',
     'MI_ADMIX_DI_TI',
+    'PGN',
     'BPA_CNN',
     'BSR',
     'DECOWA',
@@ -39,7 +40,6 @@ ALL_ATTACKS = [
     'DPA_HMA',
     'DYNAMIC_MORPH',
     'DPA_HMA_ENSEMBLE',
-    'DHF',
 ]
 
 ATTACK_COLS = {
@@ -48,6 +48,7 @@ ATTACK_COLS = {
     'TI_FGSM': 'ti_fgsm_path',
     'SI_NI_FGSM': 'si_ni_fgsm_path',
     'MI_ADMIX_DI_TI': 'mi_admix_di_ti_path',
+    'PGN': 'pgn_path',
     'BPA_CNN': 'bpa_cnn_path',
     'BSR': 'bsr_path',
     'DECOWA': 'decowa_path',
@@ -61,7 +62,6 @@ ATTACK_COLS = {
     'DPA_HMA': 'dpa_hma_path',
     'DYNAMIC_MORPH': 'dynamic_morph_path',
     'DPA_HMA_ENSEMBLE': 'dpa_hma_ensemble_path',
-    'DHF': 'dhf_path',
 }
 
 EPSILON = 0.062
@@ -79,6 +79,9 @@ LIBOOST_K = 6
 LIBOOST_N = 30
 GRA_NUM_NEIGHBOR = 20
 GRA_BETA = 3.5
+PGN_BETA = 3.0
+PGN_GAMMA = 0.5
+PGN_NUM_NEIGHBOR = 20
 GRA_SIGN_DECAY = 0.94
 DPA_HMA_SEED = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_SEED', '1'))
 DPA_HMA_NUM_ITER = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_NUM_ITER', str(NUM_ITER)))
@@ -277,85 +280,6 @@ def mi_fgsm(model, x, tgt_emb, attack_type):
         adv = adv + alpha * tf.sign(g)
         adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
         adv = tf.clip_by_value(adv, -1.0, 1.0)
-    return adv
-
-
-def dhf_attack(model, x, tgt_emb, attack_type):
-    """
-    Diversifying the High-level Features (DHF) attack.
-    Paper: Diversifying the High-level Features for better Adversarial Transferability (BMVC 2023)
-    """
-    adv = tf.identity(x)
-    g = tf.zeros_like(x)
-    alpha = EPSILON / NUM_ITER
-    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
-    
-    num_layers = len(model.layers)
-    if num_layers == 447:     # Facenet512
-        hook_idx = -5
-    elif num_layers == 162:   # ArcFace
-        hook_idx = -4
-    elif num_layers == 298:   # GhostFaceNet
-        hook_idx = -7
-        # Fix layer name collision in GhostFaceNet's internal Keras functional model
-        seen_names = set()
-        for i, layer in enumerate(model.layers):
-            if layer.name in seen_names:
-                layer._name = f"{layer.name}_{i}"
-            seen_names.add(layer.name)
-    elif num_layers == 36:    # VGG-Face
-        hook_idx = -5
-    else:
-        hook_idx = -4
-        
-    target_layer = model.layers[hook_idx]
-    feature_model = tf.keras.Model(inputs=model.input, outputs=target_layer.output)
-    
-    # Benign feature extraction (outside GradientTape)
-    benign_feat = feature_model(x, training=False)
-    if isinstance(benign_feat, list):
-        benign_feat = benign_feat[0]
-        
-    for _ in range(NUM_ITER):
-        with tf.GradientTape() as tape:
-            tape.watch(adv)
-            
-            # 1. Forward to hook
-            net = feature_model(adv, training=False)
-            if isinstance(net, list):
-                net = net[0]
-                
-            # 2. DHF Mixup (M1)
-            w = tf.random.uniform([], minval=0.0, maxval=0.2)
-            mixup_feat = w * benign_feat + (1.0 - w) * net
-            mix_mask = tf.cast((tf.random.uniform(tf.shape(net)) > 0.8), dtype=tf.float32)
-            net = mix_mask * mixup_feat + (1.0 - mix_mask) * net
-            
-            # 3. DHF Masking (M2)
-            mean_axis = list(range(1, len(net.shape)))
-            feat_mean = tf.reduce_mean(net, axis=mean_axis, keepdims=True)
-            drop_mask = tf.cast((tf.random.uniform(tf.shape(net)) <= 0.9), dtype=tf.float32)
-            net = drop_mask * net + (1.0 - drop_mask) * feat_mean
-            
-            # 4. Replay tail layers
-            for layer in model.layers[hook_idx+1:]:
-                if isinstance(layer, (tf.keras.layers.BatchNormalization, tf.keras.layers.Dropout)):
-                    net = layer(net, training=False)
-                else:
-                    net = layer(net)
-                    
-            emb = tf.nn.l2_normalize(net, axis=1)
-            cos = tf.reduce_sum(emb * tgt_emb, axis=1)
-            loss = attack_loss(cos, attack_type)
-            
-        # Perturbation update & clipping (matches mi_fgsm)
-        grad = tape.gradient(loss, adv)
-        grad = grad / (tf.reduce_mean(tf.abs(grad)) + 1e-8)
-        g = DECAY * g + grad
-        adv = adv + alpha * tf.sign(g)
-        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
-        adv = tf.clip_by_value(adv, -1.0, 1.0)
-        
     return adv
 
 
@@ -1414,6 +1338,59 @@ def dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size):
         
     return adv
 
+def pgn_attack(model, x, tgt_emb, attack_type):
+    # PGN: Penalizing Gradient Norm for Adversarial Transferability (NeurIPS 2023)
+    # Re-implemented faithfully from TransferAttack official PyTorch repo.
+    alpha = EPSILON / NUM_ITER
+    zeta = PGN_BETA * EPSILON
+    
+    adv = tf.identity(x)
+    g = tf.zeros_like(x)
+    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
+
+    for _ in range(NUM_ITER):
+        averaged_gradient = tf.zeros_like(x)
+        for _n in range(PGN_NUM_NEIGHBOR):
+            # Random sample an example
+            noise = tf.random.uniform(tf.shape(x), minval=-zeta, maxval=zeta, dtype=x.dtype)
+            x_near = adv + noise
+            x_near = tf.clip_by_value(x_near, -1.0, 1.0)
+            
+            with tf.GradientTape() as tape1:
+                tape1.watch(x_near)
+                emb1 = compute_embedding(model, x_near)
+                cos1 = tf.reduce_sum(emb1 * tgt_emb, axis=1)
+                loss1 = attack_loss(cos1, attack_type)
+            g_1 = tape1.gradient(loss1, x_near)
+            
+            # Compute the predicted point x_next
+            norm_g1 = tf.reduce_mean(tf.abs(g_1), axis=[1, 2, 3], keepdims=True) + 1e-8
+            x_next = x_near + alpha * (-g_1 / norm_g1)
+            x_next = tf.clip_by_value(x_next, -1.0, 1.0)
+            
+            # Calculate the gradient of the x_next
+            with tf.GradientTape() as tape2:
+                tape2.watch(x_next)
+                emb2 = compute_embedding(model, x_next)
+                cos2 = tf.reduce_sum(emb2 * tgt_emb, axis=1)
+                loss2 = attack_loss(cos2, attack_type)
+            g_2 = tape2.gradient(loss2, x_next)
+            
+            # Calculate the gradients
+            averaged_gradient += (1.0 - PGN_GAMMA) * g_1 + PGN_GAMMA * g_2
+            
+        averaged_gradient = averaged_gradient / float(PGN_NUM_NEIGHBOR)
+        
+        # Update momentum and adversarial perturbation
+        norm_avg_grad = tf.reduce_mean(tf.abs(averaged_gradient)) + 1e-8
+        g = DECAY * g + (averaged_gradient / norm_avg_grad)
+        
+        adv = adv + alpha * tf.sign(g)
+        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
+        adv = tf.clip_by_value(adv, -1.0, 1.0)
+        
+    return adv
+
 def build_attacker(model_name: str):
     return DeepFace.build_model(model_name).model
 
@@ -1424,8 +1401,6 @@ def run_attack(attack_name: str, model, src, tgt, attack_type: str, input_size):
         return pgd_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'MI_FGSM':
         return mi_fgsm(model, src, tgt_emb, attack_type)
-    if attack_name == 'DHF':
-        return dhf_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'TI_FGSM':
         return ti_fgsm(model, src, tgt_emb, attack_type)
     if attack_name == 'SI_NI_FGSM':
@@ -1453,6 +1428,8 @@ def run_attack(attack_name: str, model, src, tgt, attack_type: str, input_size):
         return idaa(model, src, tgt_emb, attack_type, input_size)
     if attack_name == 'DPA_HMA':
         return dpa_hma(model, src, tgt_emb, attack_type)
+    if attack_name == 'PGN':
+        return pgn_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'DYNAMIC_MORPH':
         return dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size)
     if attack_name == 'DPA_HMA_ENSEMBLE':
