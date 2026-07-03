@@ -26,6 +26,7 @@ ALL_ATTACKS = [
     'TI_FGSM',
     'SI_NI_FGSM',
     'MI_ADMIX_DI_TI',
+    'PGN',
     'BPA_CNN',
     'BSR',
     'DECOWA',
@@ -47,6 +48,7 @@ ATTACK_COLS = {
     'TI_FGSM': 'ti_fgsm_path',
     'SI_NI_FGSM': 'si_ni_fgsm_path',
     'MI_ADMIX_DI_TI': 'mi_admix_di_ti_path',
+    'PGN': 'pgn_path',
     'BPA_CNN': 'bpa_cnn_path',
     'BSR': 'bsr_path',
     'DECOWA': 'decowa_path',
@@ -77,6 +79,9 @@ LIBOOST_K = 6
 LIBOOST_N = 30
 GRA_NUM_NEIGHBOR = 20
 GRA_BETA = 3.5
+PGN_BETA = 3.0
+PGN_GAMMA = 0.5
+PGN_NUM_NEIGHBOR = 20
 GRA_SIGN_DECAY = 0.94
 DPA_HMA_SEED = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_SEED', '1'))
 DPA_HMA_NUM_ITER = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_NUM_ITER', str(NUM_ITER)))
@@ -1333,6 +1338,60 @@ def dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size):
         
     return adv
 
+@tf.function
+def pgn_attack(model, x, tgt_emb, attack_type):
+    # PGN: Penalizing Gradient Norm for Adversarial Transferability (NeurIPS 2023)
+    # Re-implemented faithfully from TransferAttack official PyTorch repo.
+    alpha = EPSILON / NUM_ITER
+    zeta = PGN_BETA * EPSILON
+    
+    adv = tf.identity(x)
+    g = tf.zeros_like(x)
+    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
+
+    for _ in tf.range(NUM_ITER):
+        averaged_gradient = tf.zeros_like(x)
+        for _n in tf.range(PGN_NUM_NEIGHBOR):
+            # Random sample an example
+            noise = tf.random.uniform(tf.shape(x), minval=-zeta, maxval=zeta, dtype=x.dtype)
+            x_near = adv + noise
+            x_near = tf.clip_by_value(x_near, -1.0, 1.0)
+            
+            with tf.GradientTape() as tape1:
+                tape1.watch(x_near)
+                emb1 = compute_embedding(model, x_near)
+                cos1 = tf.reduce_sum(emb1 * tgt_emb, axis=1)
+                loss1 = attack_loss(cos1, attack_type)
+            g_1 = tape1.gradient(loss1, x_near)
+            
+            # Compute the predicted point x_next
+            norm_g1 = tf.reduce_mean(tf.abs(g_1), axis=[1, 2, 3], keepdims=True) + 1e-8
+            x_next = x_near + alpha * (-g_1 / norm_g1)
+            x_next = tf.clip_by_value(x_next, -1.0, 1.0)
+            
+            # Calculate the gradient of the x_next
+            with tf.GradientTape() as tape2:
+                tape2.watch(x_next)
+                emb2 = compute_embedding(model, x_next)
+                cos2 = tf.reduce_sum(emb2 * tgt_emb, axis=1)
+                loss2 = attack_loss(cos2, attack_type)
+            g_2 = tape2.gradient(loss2, x_next)
+            
+            # Calculate the gradients
+            averaged_gradient += (1.0 - PGN_GAMMA) * g_1 + PGN_GAMMA * g_2
+            
+        averaged_gradient = averaged_gradient / float(PGN_NUM_NEIGHBOR)
+        
+        # Update momentum and adversarial perturbation
+        norm_avg_grad = tf.reduce_mean(tf.abs(averaged_gradient)) + 1e-8
+        g = DECAY * g + (averaged_gradient / norm_avg_grad)
+        
+        adv = adv + alpha * tf.sign(g)
+        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
+        adv = tf.clip_by_value(adv, -1.0, 1.0)
+        
+    return adv
+
 def build_attacker(model_name: str):
     return DeepFace.build_model(model_name).model
 
@@ -1370,6 +1429,8 @@ def run_attack(attack_name: str, model, src, tgt, attack_type: str, input_size):
         return idaa(model, src, tgt_emb, attack_type, input_size)
     if attack_name == 'DPA_HMA':
         return dpa_hma(model, src, tgt_emb, attack_type)
+    if attack_name == 'PGN':
+        return pgn_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'DYNAMIC_MORPH':
         return dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size)
     if attack_name == 'DPA_HMA_ENSEMBLE':
