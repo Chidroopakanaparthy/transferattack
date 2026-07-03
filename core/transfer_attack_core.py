@@ -1338,6 +1338,7 @@ def dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size):
         
     return adv
 
+@tf.function
 def pgn_attack(model, x, tgt_emb, attack_type):
     # PGN: Penalizing Gradient Norm for Adversarial Transferability (NeurIPS 2023)
     # Re-implemented faithfully from TransferAttack official PyTorch repo.
@@ -1348,9 +1349,9 @@ def pgn_attack(model, x, tgt_emb, attack_type):
     g = tf.zeros_like(x)
     tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
 
-    for _ in range(NUM_ITER):
+    for _ in tf.range(NUM_ITER):
         averaged_gradient = tf.zeros_like(x)
-        for _n in range(PGN_NUM_NEIGHBOR):
+        for _n in tf.range(PGN_NUM_NEIGHBOR):
             # Random sample an example
             noise = tf.random.uniform(tf.shape(x), minval=-zeta, maxval=zeta, dtype=x.dtype)
             x_near = adv + noise
