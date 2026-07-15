@@ -1365,8 +1365,7 @@ def pgn_attack(model, x, tgt_emb, attack_type):
             g_1 = tape1.gradient(loss1, x_near)
             
             # Compute the predicted point x_next
-            norm_g1 = tf.reduce_mean(tf.abs(g_1), axis=[1, 2, 3], keepdims=True) + 1e-8
-            x_next = x_near + alpha * (g_1 / norm_g1)
+            x_next = x_near + alpha * tf.sign(g_1)
             x_next = tf.clip_by_value(x_next, -1.0, 1.0)
             
             # Calculate the gradient of the x_next
