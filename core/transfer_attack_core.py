@@ -1338,50 +1338,47 @@ def dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size):
         
     return adv
 
-@tf.function
 def pgn_attack(model, x, tgt_emb, attack_type):
-    # PGN: Penalizing Gradient Norm for Adversarial Transferability (NeurIPS 2023)
-    # Re-implemented faithfully to the exact theoretical formulation.
     alpha = EPSILON / NUM_ITER
     zeta = PGN_BETA * EPSILON
-    
+
     adv = tf.identity(x)
     g = tf.zeros_like(x)
     tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
 
-    for _ in tf.range(NUM_ITER):
-        # 1. Compute original gradient g_1 at the current adversarial point
-        with tf.GradientTape() as tape1:
-            tape1.watch(adv)
-            emb1 = compute_embedding(model, adv)
-            cos1 = tf.reduce_sum(emb1 * tgt_emb, axis=1)
-            loss1 = attack_loss(cos1, attack_type)
-        g_1 = tape1.gradient(loss1, adv)
-        
-        # 2. Compute the lookahead point x_next (using L_inf optimal step)
-        x_next = adv + zeta * tf.sign(g_1)
-        x_next = tf.clip_by_value(x_next, -1.0, 1.0)
-        
-        # 3. Calculate gradient at the lookahead point
-        with tf.GradientTape() as tape2:
-            tape2.watch(x_next)
-            emb2 = compute_embedding(model, x_next)
-            cos2 = tf.reduce_sum(emb2 * tgt_emb, axis=1)
-            loss2 = attack_loss(cos2, attack_type)
-        g_2 = tape2.gradient(loss2, x_next)
-        
-        # 4. Interpolate gradients to penalize the gradient norm
-        g_pgn = (1.0 - PGN_GAMMA) * g_1 + PGN_GAMMA * g_2
-        
-        # 5. Standard MI-FGSM momentum update
-        norm_g_pgn = tf.reduce_mean(tf.abs(g_pgn), axis=[1, 2, 3], keepdims=True) + 1e-8
-        g = DECAY * g + (g_pgn / norm_g_pgn)
-        
-        # 6. Step the adversarial image
+    for _ in range(NUM_ITER):
+        averaged_gradient = tf.zeros_like(x)
+        for _ in range(PGN_NUM_NEIGHBOR):
+            noise = tf.random.uniform(tf.shape(x), minval=-zeta, maxval=zeta, dtype=x.dtype)
+            x_near = tf.clip_by_value(adv + noise, -1.0, 1.0)
+
+            with tf.GradientTape() as tape1:
+                tape1.watch(x_near)
+                emb1 = compute_embedding(model, x_near)
+                cos1 = tf.reduce_sum(emb1 * tgt_emb, axis=1)
+                loss1 = attack_loss(cos1, attack_type)
+            g_1 = tape1.gradient(loss1, x_near)
+
+            norm_g1 = tf.reduce_mean(tf.abs(g_1), axis=[1, 2, 3], keepdims=True) + 1e-8
+            x_next = tf.clip_by_value(x_near + alpha * (-g_1 / norm_g1), -1.0, 1.0)
+
+            with tf.GradientTape() as tape2:
+                tape2.watch(x_next)
+                emb2 = compute_embedding(model, x_next)
+                cos2 = tf.reduce_sum(emb2 * tgt_emb, axis=1)
+                loss2 = attack_loss(cos2, attack_type)
+            g_2 = tape2.gradient(loss2, x_next)
+
+            averaged_gradient += (1.0 - PGN_GAMMA) * g_1 + PGN_GAMMA * g_2
+
+        averaged_gradient = averaged_gradient / float(PGN_NUM_NEIGHBOR)
+        norm_avg_grad = tf.reduce_mean(tf.abs(averaged_gradient)) + 1e-8
+        g = DECAY * g + (averaged_gradient / norm_avg_grad)
+
         adv = adv + alpha * tf.sign(g)
         adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
         adv = tf.clip_by_value(adv, -1.0, 1.0)
-        
+
     return adv
 
 def build_attacker(model_name: str):
