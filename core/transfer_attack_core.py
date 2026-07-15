@@ -1338,6 +1338,7 @@ def dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size):
         
     return adv
 
+@tf.function
 def pgn_attack(model, x, tgt_emb, attack_type):
     alpha = EPSILON / NUM_ITER
     zeta = PGN_BETA * EPSILON
