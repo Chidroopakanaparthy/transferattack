@@ -42,30 +42,6 @@ This repo is intentionally a standalone vanilla transfer-attack exercise.
 - TI_FGSM: 20.42%
 - PGD: 16.67%
 
-## Current verified student results
-- DPA_HMA (Kushal Khemka, DTU): 40.21% breach rate, 0.2150 mean impact
-- This currently ranks first among the verified student-contributed attacks on the provided subset.
-- BSR (Chirag Sharma, IIIT Vadodara): 36.46% breach rate, 0.2048 mean impact
-- This currently ranks second among the verified student-contributed attacks on the provided subset.
-- LI_BOOST_MI (Charushi, IGDTUW): 35.21% breach rate, 0.2007 mean impact
-- This currently ranks third among the verified student-contributed attacks on the provided subset.
-- MIG (Lakshita Sharma, Bhagwan Parshuram Institute of Technology): 33.54% breach rate, 0.1946 mean impact
-- This currently ranks fourth among the verified student-contributed attacks on the provided subset.
-- DeCowA (Om Singh Rawat, IIT Delhi): 32.50% breach rate, 0.1931 mean impact
-- This currently ranks fifth among the verified student-contributed attacks on the provided subset.
-- BPA_CNN (Om Singh Rawat, IIT Delhi): 30.21% breach rate, 0.1803 mean impact
-- This also ranks above the strongest vanilla baseline on the provided subset.
-- ATT_CNN (Keshav Raj, IIIT Delhi): 26.67% breach rate, 0.1646 mean impact
-- This verified result is tied with MI_FGSM on breach rate and remains below SI_NI_FGSM.
-- ATT_CNN_PATCH (Pratyush Kumar, KCC Institute of Technology and Management, A.K.T.U.): 23.54% breach rate, 0.1476 mean impact
-- This verified result is above TI_FGSM and PGD, but below the stronger vanilla baselines on the provided subset.
-- SIA_MI_TI (Janhavi Kishor, SRM University): 23.33% breach rate, 0.1376 mean impact
-- This verified result ranks below MI_ADMIX_DI_TI and above TI_FGSM on the provided subset.
-
-## Not included
-- additional objective-level modifications from other project branches
-- API-specific evaluation code paths
-
 ## Current experiment setup
 ### Attacker (surrogate) models
 - Facenet512
