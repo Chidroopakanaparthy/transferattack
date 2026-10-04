@@ -42,6 +42,7 @@ ALL_ATTACKS = [
     'IDAA',
     'DPA_HMA',
     'DYNAMIC_MORPH',
+    'PGN_MESH',
 ]
 
 ATTACK_COLS = {
@@ -66,6 +67,7 @@ ATTACK_COLS = {
     'IDAA': 'idaa_path',
     'DYNAMIC_MORPH': 'dynamic_morph_path',
     'DPA_HMA': 'dpa_hma_path',
+    'PGN_MESH': 'pgn_mesh_path',
 }
 
 EPSILON = 0.062
@@ -87,6 +89,11 @@ GRA_SIGN_DECAY = 0.94
 PGN_BETA = 3.0
 PGN_GAMMA = 0.5
 PGN_NUM_NEIGHBOR = 20
+PGN_MESH_SEED = int(os.environ.get('TRANSFER_ATTACK_PGN_MESH_SEED', '1'))
+PGN_MESH_VIEW_STD_RANGE = (0.01, 0.08)
+PGN_MESH_RESAMPLE_PROB = 0.5
+PGN_MESH_RESAMPLE_RANGE = (0.5, 1.0)
+PGN_MESH_MIN_RESAMPLE_SIDE = 16
 DPA_HMA_SEED = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_SEED', '1'))
 DPA_HMA_NUM_ITER = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_NUM_ITER', str(NUM_ITER)))
 DPA_HMA_ENSEMBLE_NUM_ITER = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_ENSEMBLE_NUM_ITER', str(DPA_HMA_NUM_ITER)))
@@ -99,6 +106,7 @@ DPA_HMA_ENSEMBLE_SURROGATES_BY_VICTIM = {
     'IR152': ('Facenet512', 'ArcFace', 'GhostFaceNet'),
 }
 _dpa_hma_seeded = False
+_pgn_mesh_seeded = False
 
 
 def set_global_seed(seed: int) -> None:
@@ -112,6 +120,13 @@ def _ensure_dpa_hma_seed() -> None:
     if not _dpa_hma_seeded:
         set_global_seed(DPA_HMA_SEED)
         _dpa_hma_seeded = True
+
+
+def _ensure_pgn_mesh_seed() -> None:
+    global _pgn_mesh_seeded
+    if not _pgn_mesh_seeded:
+        set_global_seed(PGN_MESH_SEED)
+        _pgn_mesh_seeded = True
 
 
 def dpa_hma_ensemble_surrogates_for_victim(victim_name: str):
@@ -1355,6 +1370,157 @@ def pgn_attack(model, x, tgt_emb, attack_type):
     return adv
 
 
+def _pgn_mesh_truncated_normal(std):
+    # Same distribution as tf.random.truncated_normal: draws beyond 2 std are re-sampled.
+    std = np.asarray(std, dtype=np.float64)
+    out = np.random.normal(0.0, std)
+    redraw = np.abs(out) > 2.0 * std
+    while np.any(redraw):
+        out[redraw] = np.random.normal(0.0, std[redraw])
+        redraw = np.abs(out) > 2.0 * std
+    return out
+
+
+def _pgn_mesh_sample_views(num_views: int, height: int, width: int, resample_prob: float):
+    """Sample one face-safe view per PGN neighbour.
+
+    A view is an affine jitter (rotation, scale, translation) drawn from the same
+    distribution as the DPA_HMA affine views, followed with probability
+    `resample_prob` by a down/up resampling round trip that mimics the resize a
+    victim with a smaller native resolution applies to the saved image.
+    """
+    lo, hi = PGN_MESH_VIEW_STD_RANGE
+    std_proj = np.random.uniform(lo, hi, num_views)
+    std_rotate = np.random.uniform(lo, hi, num_views)
+    angle = _pgn_mesh_truncated_normal(std_rotate)
+    scale = 1.0 + _pgn_mesh_truncated_normal(std_proj)
+    shift_x = _pgn_mesh_truncated_normal(std_proj) * width
+    shift_y = _pgn_mesh_truncated_normal(std_proj) * height
+
+    cx, cy = width / 2.0, height / 2.0
+    cos_a = np.cos(-angle) * scale
+    sin_a = np.sin(-angle) * scale
+    tx = cx - cx * cos_a + cy * sin_a + shift_x
+    ty = cy - cx * sin_a - cy * cos_a + shift_y
+    zeros = np.zeros(num_views)
+    transforms = np.stack([cos_a, -sin_a, tx, sin_a, cos_a, ty, zeros, zeros], axis=1)
+
+    ratios = np.random.uniform(PGN_MESH_RESAMPLE_RANGE[0], PGN_MESH_RESAMPLE_RANGE[1], num_views)
+    use_resample = np.random.uniform(size=num_views) < resample_prob
+    sizes = []
+    for ratio, resample in zip(ratios, use_resample):
+        if not resample:
+            sizes.append(None)
+            continue
+        sizes.append((
+            max(PGN_MESH_MIN_RESAMPLE_SIDE, int(round(height * ratio))),
+            max(PGN_MESH_MIN_RESAMPLE_SIDE, int(round(width * ratio))),
+        ))
+    return tf.constant(transforms, dtype=tf.float32), sizes
+
+
+def _pgn_mesh_apply_views(images, transforms, sizes):
+    height, width = int(images.shape[1]), int(images.shape[2])
+    warped = tf.raw_ops.ImageProjectiveTransformV3(
+        images=tf.cast(images, tf.float32),
+        transforms=transforms,
+        output_shape=tf.constant([height, width], dtype=tf.int32),
+        interpolation='BILINEAR',
+        fill_mode='REFLECT',
+        fill_value=0.0,
+    )
+    views = []
+    for i, size in enumerate(sizes):
+        view = warped[i:i + 1]
+        if size is not None:
+            view = tf.image.resize(view, size, method='bilinear', antialias=True)
+            view = tf.image.resize(view, (height, width), method='bilinear')
+        views.append(view)
+    return tf.concat(views, axis=0)
+
+
+def _pgn_mesh_view_gradient(model, samples, tgt_rep, attack_type, views):
+    with tf.GradientTape() as tape:
+        tape.watch(samples)
+        batch = samples if views is None else _pgn_mesh_apply_views(samples, *views)
+        emb = compute_embedding(model, batch)
+        cos = tf.reduce_sum(emb * tgt_rep, axis=1)
+        # attack_loss averages over the batch; scale back so each neighbour keeps a full-size gradient.
+        loss = attack_loss(cos, attack_type) * float(samples.shape[0])
+    grad = tape.gradient(loss, samples)
+    if grad is None:
+        raise RuntimeError('PGN_MESH: no gradient reached the sampled neighbours')
+    return tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
+
+
+# PGN_MESH: PGN (Ge et al., "Boosting Adversarial Transferability by Achieving
+# Flat Local Maxima", NeurIPS 2023) combined with input transformations, as in
+# Sec. 4.5 / Table 3 of the paper and the `self.transform` hook of the official
+# TransferAttack PGN class.
+# - Follows the official code (Trustworthy-AI-Group/PGN): uniform zeta-ball
+#   neighbours, x* = x' - alpha * g' / mean|g'|, (1 - delta) * g' + delta * g*,
+#   MI momentum. Neighbours and x* are not clipped, as in the official code.
+# - Each neighbour gets one face-safe view (DPA_HMA-style affine jitter plus an
+#   optional resampling round trip). g' and g* use the SAME view, so g* - g'
+#   stays a finite difference of one function and the gradient-norm penalty is
+#   applied to the transformed loss.
+# - The N neighbours are evaluated as one batch per step (same maths as the
+#   sequential loop, faster on GPU).
+# use_views=False gives the official PGN; beta=0, gamma=0 gives views-only MI.
+def pgn_mesh_attack(
+    model,
+    x,
+    tgt_emb,
+    attack_type,
+    num_neighbor: int = PGN_NUM_NEIGHBOR,
+    beta: float = PGN_BETA,
+    gamma: float = PGN_GAMMA,
+    num_iter: int = NUM_ITER,
+    use_views: bool = True,
+    resample_prob: float = PGN_MESH_RESAMPLE_PROB,
+    clip_samples: bool = False,
+):
+    _ensure_pgn_mesh_seed()
+    if num_iter <= 0 or num_neighbor <= 0:
+        raise ValueError('PGN_MESH needs positive num_iter and num_neighbor')
+    if int(x.shape[0]) != 1:
+        raise ValueError('PGN_MESH expects a single image per call (batch size 1)')
+
+    alpha = EPSILON / num_iter
+    zeta = beta * EPSILON
+    height, width = int(x.shape[1]), int(x.shape[2])
+    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
+    tgt_rep = tf.repeat(tgt_emb, num_neighbor, axis=0)
+
+    adv = tf.identity(x)
+    momentum = tf.zeros_like(x)
+
+    for _ in range(num_iter):
+        views = _pgn_mesh_sample_views(num_neighbor, height, width, resample_prob) if use_views else None
+
+        x_near = tf.repeat(adv, num_neighbor, axis=0)
+        if zeta > 0:
+            x_near = x_near + tf.random.uniform(tf.shape(x_near), -zeta, zeta, dtype=x.dtype)
+        if clip_samples:
+            x_near = tf.clip_by_value(x_near, -1.0, 1.0)
+        g_near = _pgn_mesh_view_gradient(model, x_near, tgt_rep, attack_type, views)
+
+        g_scale = tf.reduce_mean(tf.abs(g_near), axis=[1, 2, 3], keepdims=True) + 1e-8
+        x_star = x_near - alpha * g_near / g_scale
+        if clip_samples:
+            x_star = tf.clip_by_value(x_star, -1.0, 1.0)
+        g_star = _pgn_mesh_view_gradient(model, x_star, tgt_rep, attack_type, views)
+
+        grad = tf.reduce_mean((1.0 - gamma) * g_near + gamma * g_star, axis=0, keepdims=True)
+        grad = grad / (tf.reduce_mean(tf.abs(grad)) + 1e-8)
+        momentum = DECAY * momentum + grad
+        adv = adv + alpha * tf.sign(momentum)
+        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
+        adv = tf.clip_by_value(adv, -1.0, 1.0)
+
+    return adv
+
+
 def dpa_hma(model, x, tgt_emb, attack_type, num_copies: int = 8, num_iter: int = DPA_HMA_NUM_ITER):
     _ensure_dpa_hma_seed()
     tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
@@ -1620,6 +1786,8 @@ def run_attack(attack_name: str, model, src, tgt, attack_type: str, input_size):
         return gra_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'PGN':
         return pgn_attack(model, src, tgt_emb, attack_type)
+    if attack_name == 'PGN_MESH':
+        return pgn_mesh_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'IDAA':
         return idaa(model, src, tgt_emb, attack_type, input_size)
     if attack_name == 'DPA_HMA':
