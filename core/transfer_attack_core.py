@@ -43,6 +43,7 @@ ALL_ATTACKS = [
     'DPA_HMA',
     'DYNAMIC_MORPH',
     'PGN_MESH',
+    'PGN_MESH_PLUS',
 ]
 
 ATTACK_COLS = {
@@ -68,6 +69,7 @@ ATTACK_COLS = {
     'DYNAMIC_MORPH': 'dynamic_morph_path',
     'DPA_HMA': 'dpa_hma_path',
     'PGN_MESH': 'pgn_mesh_path',
+    'PGN_MESH_PLUS': 'pgn_mesh_plus_path',
 }
 
 EPSILON = 0.062
@@ -94,6 +96,13 @@ PGN_MESH_VIEW_STD_RANGE = (0.01, 0.08)
 PGN_MESH_RESAMPLE_PROB = 0.5
 PGN_MESH_RESAMPLE_RANGE = (0.5, 1.0)
 PGN_MESH_MIN_RESAMPLE_SIDE = 16
+PGN_MESH_PLUS_SEED = int(os.environ.get('TRANSFER_ATTACK_PGN_MESH_PLUS_SEED', '1'))
+PGN_MESH_PLUS_NUM_GROUPS = 4
+PGN_MESH_PLUS_FIDELITY = 0.90
+PGN_MESH_PLUS_HMA_STEP = 0.25
+PGN_MESH_PLUS_SIGMA_RANGE = (1e-3, 0.5)
+PGN_MESH_PLUS_CALIB_STEPS = 10
+PGN_MESH_PLUS_CALIB_DRAWS = 2
 DPA_HMA_SEED = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_SEED', '1'))
 DPA_HMA_NUM_ITER = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_NUM_ITER', str(NUM_ITER)))
 DPA_HMA_ENSEMBLE_NUM_ITER = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_ENSEMBLE_NUM_ITER', str(DPA_HMA_NUM_ITER)))
@@ -107,6 +116,8 @@ DPA_HMA_ENSEMBLE_SURROGATES_BY_VICTIM = {
 }
 _dpa_hma_seeded = False
 _pgn_mesh_seeded = False
+_pgn_mesh_plus_seeded = False
+_pgn_mesh_plus_states = {}
 
 
 def set_global_seed(seed: int) -> None:
@@ -127,6 +138,13 @@ def _ensure_pgn_mesh_seed() -> None:
     if not _pgn_mesh_seeded:
         set_global_seed(PGN_MESH_SEED)
         _pgn_mesh_seeded = True
+
+
+def _ensure_pgn_mesh_plus_seed() -> None:
+    global _pgn_mesh_plus_seeded
+    if not _pgn_mesh_plus_seeded:
+        set_global_seed(PGN_MESH_PLUS_SEED)
+        _pgn_mesh_plus_seeded = True
 
 
 def dpa_hma_ensemble_surrogates_for_victim(victim_name: str):
@@ -1521,6 +1539,217 @@ def pgn_mesh_attack(
     return adv
 
 
+def _pgn_mesh_plus_raw_variable(var):
+    # tf-keras models hold tf.Variable objects; Keras 3 wraps them and keeps the tf.Variable in `.value`.
+    return var if isinstance(var, tf.Variable) else var.value
+
+
+def _pgn_mesh_plus_state(model):
+    """Kernel variables of the surrogate plus a snapshot of their clean values, cached per model."""
+    state = _pgn_mesh_plus_states.get(id(model))
+    if state is not None and state['model'] is model:
+        return state
+    variables, seen = [], set()
+    for var in model.weights:
+        if 'kernel' not in var.name:
+            continue
+        raw = _pgn_mesh_plus_raw_variable(var)
+        if id(raw) not in seen:
+            seen.add(id(raw))
+            variables.append(raw)
+    if not variables:
+        raise RuntimeError('PGN_MESH_PLUS: the surrogate has no kernel weights to augment')
+    state = {
+        'model': model,
+        'variables': variables,
+        'clean': [tf.identity(var) for var in variables],
+        'sigma': {},
+    }
+    _pgn_mesh_plus_states[id(model)] = state
+    return state
+
+
+def _pgn_mesh_plus_assign(state, sigma, offsets=None):
+    """Load clean * (1 + sigma * N(0, 1)), plus the hard-model offset, into the surrogate kernels."""
+    for i, (var, clean) in enumerate(zip(state['variables'], state['clean'])):
+        value = clean
+        if sigma > 0:
+            value = clean * (1.0 + sigma * tf.random.normal(tf.shape(clean), dtype=clean.dtype))
+        if offsets is not None:
+            value = value + offsets[i]
+        var.assign(value)
+
+
+def _pgn_mesh_plus_restore(state):
+    for var, clean in zip(state['variables'], state['clean']):
+        var.assign(clean)
+
+
+def _pgn_mesh_plus_sigma(model, state, x, fidelity):
+    """Largest relative weight-noise level that keeps embedding cosine >= fidelity with the clean model.
+
+    Calibrated once per surrogate (bisection in log space on the first source image it sees), so a
+    single fidelity value gives comparable parameter diversity for all four architectures.
+    """
+    if fidelity >= 1.0:
+        return 0.0
+    key = round(float(fidelity), 4)
+    if key in state['sigma']:
+        return state['sigma'][key]
+    reference = compute_embedding(model, x)
+    log_lo = float(np.log(PGN_MESH_PLUS_SIGMA_RANGE[0]))
+    log_hi = float(np.log(PGN_MESH_PLUS_SIGMA_RANGE[1]))
+    try:
+        for _ in range(PGN_MESH_PLUS_CALIB_STEPS):
+            log_mid = 0.5 * (log_lo + log_hi)
+            sims = []
+            for _ in range(PGN_MESH_PLUS_CALIB_DRAWS):
+                _pgn_mesh_plus_assign(state, float(np.exp(log_mid)))
+                sims.append(float(tf.reduce_sum(compute_embedding(model, x) * reference)))
+            # A NaN similarity fails the comparison, so a broken model shrinks sigma.
+            if np.mean(sims) >= fidelity:
+                log_lo = log_mid
+            else:
+                log_hi = log_mid
+    finally:
+        _pgn_mesh_plus_restore(state)
+    sigma = float(np.exp(log_lo))
+    state['sigma'][key] = sigma
+    return sigma
+
+
+def _pgn_mesh_plus_finite(grad):
+    grad = tf.convert_to_tensor(grad)
+    return tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
+
+
+def _pgn_mesh_plus_gradient(model, samples, tgt_rep, attack_type, views, weight_vars=None):
+    """Input gradient of the view loss and, when weight_vars is given, its kernel gradients (one backward pass)."""
+    with tf.GradientTape() as tape:
+        tape.watch(samples)
+        if weight_vars is not None:
+            tape.watch(weight_vars)
+        batch = samples if views is None else _pgn_mesh_apply_views(samples, *views)
+        emb = compute_embedding(model, batch)
+        cos = tf.reduce_sum(emb * tgt_rep, axis=1)
+        # attack_loss averages over the batch; scale back so each neighbour keeps a full-size gradient.
+        loss = attack_loss(cos, attack_type) * float(samples.shape[0])
+    sources = [samples] + (list(weight_vars) if weight_vars is not None else [])
+    grads = tape.gradient(loss, sources)
+    if grads[0] is None:
+        raise RuntimeError('PGN_MESH_PLUS: no gradient reached the sampled neighbours')
+    weight_grads = None
+    if weight_vars is not None:
+        weight_grads = [
+            tf.zeros_like(var) if grad is None else _pgn_mesh_plus_finite(grad)
+            for grad, var in zip(grads[1:], weight_vars)
+        ]
+    return _pgn_mesh_plus_finite(grads[0]), weight_grads
+
+
+# PGN_MESH_PLUS: PGN_MESH (PGN, NeurIPS 2023, with face-safe input views) plus the
+# surrogate-side augmentation of DPA (Zhou et al., "Improving the Transferability of
+# Adversarial Attacks on Face Recognition with Diverse Parameters Augmentation", CVPR 2025).
+# - Diverse parameters: the N PGN neighbours are split into G groups. Each group is
+#   evaluated on its own copy of the surrogate with kernels w * (1 + sigma * N(0, 1)).
+#   DPA builds diverse surrogates from training checkpoints (DPO); no training is allowed
+#   here, so the parameter diversity is sampled around the pre-trained weights instead
+#   (Gaussian weight posterior, Li et al., ICLR 2023). sigma is calibrated per surrogate
+#   so that clean embeddings keep cosine `fidelity` with the original model.
+# - Hard model aggregation: as in DPA HMA, from the second iteration on, every sampled
+#   model also carries an accumulated "beneficial" perturbation that works against the
+#   attack. DPA applies omega <- omega + eta * sign(grad) to feature maps; here it is applied
+#   to the kernels, offset <- offset - hma_step * sigma * |w| * sign(dL/dw), because
+#   attack_loss is ascended by the attacker.
+# - Each group's target embedding is recomputed on that group's model, and g' and g*
+#   use the same model and the same view, so g* - g' stays a finite difference of one
+#   function (PGN). Kernels are always restored, also when the attack raises.
+# fidelity=1.0 (or hma_step=0) switches the parameter parts off.
+def pgn_mesh_plus_attack(
+    model,
+    x,
+    tgt,
+    attack_type,
+    num_neighbor: int = PGN_NUM_NEIGHBOR,
+    num_groups: int = PGN_MESH_PLUS_NUM_GROUPS,
+    fidelity: float = PGN_MESH_PLUS_FIDELITY,
+    hma_step: float = PGN_MESH_PLUS_HMA_STEP,
+    beta: float = PGN_BETA,
+    gamma: float = PGN_GAMMA,
+    num_iter: int = NUM_ITER,
+    use_views: bool = True,
+    resample_prob: float = PGN_MESH_RESAMPLE_PROB,
+):
+    _ensure_pgn_mesh_plus_seed()
+    if num_iter <= 0 or num_neighbor <= 0 or num_groups <= 0:
+        raise ValueError('PGN_MESH_PLUS needs positive num_iter, num_neighbor and num_groups')
+    if num_neighbor % num_groups != 0:
+        raise ValueError('PGN_MESH_PLUS needs num_neighbor to be a multiple of num_groups')
+    if int(x.shape[0]) != 1 or int(tgt.shape[0]) != 1:
+        raise ValueError('PGN_MESH_PLUS expects a single source and target image per call (batch size 1)')
+
+    state = _pgn_mesh_plus_state(model)
+    sigma = _pgn_mesh_plus_sigma(model, state, x, fidelity)
+    use_hma = hma_step > 0 and sigma > 0
+    group_size = num_neighbor // num_groups
+    alpha = EPSILON / num_iter
+    zeta = beta * EPSILON
+    height, width = int(x.shape[1]), int(x.shape[2])
+
+    adv = tf.identity(x)
+    momentum = tf.zeros_like(x)
+    offsets = [tf.zeros_like(clean) for clean in state['clean']] if use_hma else None
+
+    try:
+        for step in range(num_iter):
+            views = _pgn_mesh_sample_views(num_neighbor, height, width, resample_prob) if use_views else None
+            group_grads = []
+            weight_grad_sum = None
+            for group in range(num_groups):
+                lo, hi = group * group_size, (group + 1) * group_size
+                group_views = None if views is None else (views[0][lo:hi], views[1][lo:hi])
+
+                _pgn_mesh_plus_assign(state, sigma, offsets)
+                tgt_emb = compute_embedding(model, tgt)
+                tgt_rep = tf.repeat(tgt_emb, group_size, axis=0)
+
+                x_near = tf.repeat(adv, group_size, axis=0)
+                if zeta > 0:
+                    x_near = x_near + tf.random.uniform(tf.shape(x_near), -zeta, zeta, dtype=x.dtype)
+                g_near, weight_grads = _pgn_mesh_plus_gradient(
+                    model, x_near, tgt_rep, attack_type, group_views,
+                    state['variables'] if use_hma else None,
+                )
+
+                g_scale = tf.reduce_mean(tf.abs(g_near), axis=[1, 2, 3], keepdims=True) + 1e-8
+                x_star = x_near - alpha * g_near / g_scale
+                g_star, _ = _pgn_mesh_plus_gradient(model, x_star, tgt_rep, attack_type, group_views)
+
+                group_grads.append((1.0 - gamma) * g_near + gamma * g_star)
+                if weight_grads is not None:
+                    if weight_grad_sum is None:
+                        weight_grad_sum = weight_grads
+                    else:
+                        weight_grad_sum = [a + b for a, b in zip(weight_grad_sum, weight_grads)]
+
+            grad = tf.reduce_mean(tf.concat(group_grads, axis=0), axis=0, keepdims=True)
+            grad = grad / (tf.reduce_mean(tf.abs(grad)) + 1e-8)
+            momentum = DECAY * momentum + grad
+            adv = adv + alpha * tf.sign(momentum)
+            adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
+            adv = tf.clip_by_value(adv, -1.0, 1.0)
+
+            if use_hma and step < num_iter - 1:
+                offsets = [
+                    offset - hma_step * sigma * tf.abs(clean) * tf.sign(weight_grad)
+                    for offset, clean, weight_grad in zip(offsets, state['clean'], weight_grad_sum)
+                ]
+    finally:
+        _pgn_mesh_plus_restore(state)
+
+    return adv
+
+
 def dpa_hma(model, x, tgt_emb, attack_type, num_copies: int = 8, num_iter: int = DPA_HMA_NUM_ITER):
     _ensure_dpa_hma_seed()
     tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
@@ -1788,6 +2017,8 @@ def run_attack(attack_name: str, model, src, tgt, attack_type: str, input_size):
         return pgn_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'PGN_MESH':
         return pgn_mesh_attack(model, src, tgt_emb, attack_type)
+    if attack_name == 'PGN_MESH_PLUS':
+        return pgn_mesh_plus_attack(model, src, tgt, attack_type)
     if attack_name == 'IDAA':
         return idaa(model, src, tgt_emb, attack_type, input_size)
     if attack_name == 'DPA_HMA':
